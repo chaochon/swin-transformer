@@ -2,9 +2,11 @@
 import warnings
 from collections import OrderedDict
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from mmcv.cnn import build_norm_layer
 from mmengine.logging import MMLogger
 from mmengine.model import BaseModule, ModuleList
@@ -14,11 +16,14 @@ from mmengine.runner.checkpoint import CheckpointLoader
 from mmengine.utils import to_2tuple
 
 from mmdet.registry import MODELS
-from ..layers import PatchEmbed, PatchMerging
+from mmdet.models.layers import PatchEmbed, PatchMerging
 
-from .swin import swin_converter, SwinBlockSequence
+from mmdet.models.backbones.swin import swin_converter, SwinBlockSequence
 
+from math import sqrt
 
+from torchvision.io import read_image
+import torchvision.transforms as T
 
 @MODELS.register_module()
 class SwinTransformerCustom(BaseModule):
@@ -301,21 +306,8 @@ class SwinTransformerCustom(BaseModule):
 
     def forward(self, x):
 
-        # perform 2d fourier transformer
-        fft_result = torch.fft.rfft2(x, dim=(-2,-1)) # x:(batch, channel, height, weight)
-
-        # centre
-        fft_result_shifted = torch.fft.fftshift(fft_result)
-
-        # 计算幅度谱
-        magnitude_shifted = torch.abs(fft_result_shifted)
-
-        # use high-pass filter todo: set learned threshold of high frequency
-        filtered_magnitude_shifted = high_pass_filter(magnitude_shifted, cutoff_frequency=1)
-
-        # 将频谱重新移回原始位置
-        filtered_fft_result_shifted = filtered_magnitude_shifted * torch.exp(1j * torch.angle(fft_result_shifted))
-        high_freq_x = torch.fft.ifftshift(filtered_fft_result_shifted)
+        high_freq_x, _, _ = extract_high_freq_feat(x)
+        high_freq_x = high_freq_x.to(torch.float32).mean(dim=1, keepdim=True)
 
         x, hw_shape = self.patch_embed(x)
 
@@ -333,41 +325,89 @@ class SwinTransformerCustom(BaseModule):
                                self.num_features[i]).permute(0, 3, 1,
                                                              2).contiguous()
 
-                out = out + high_freq_x  # add high_freq_info of input image
+                # add high_freq_info of input image
+                out = out + F.interpolate(high_freq_x, size=(out.shape[2], out.shape[3]), mode='bilinear', align_corners=False)
                 outs.append(out)
 
         return outs
 
-def high_pass_filter(magnitude_shifted, cutoff_frequency):
-    """
-    Apply high-pass filter to the magnitude spectrum.
-    Args:
-        magnitude (Tensor): Magnitude spectrum of the Fourier transform.
-        cutoff_frequency (int): The cutoff frequency to remove low frequencies.
-    Returns:
-        Tensor: Filtered magnitude spectrum.
-    """
-    # 获取图像的中心坐标
-    height, width = magnitude_shifted.shape[-2], magnitude_shifted.shape[-1]
-    cy, cx = height // 2, width // 2  # 中心点坐标
+def extract_high_freq_feat(x, low_freq_size=8):
+        # 提取通道数、宽度和高度
+        B, C, H, W = x.shape
 
-    # 创建高通滤波器
-    high_pass = torch.ones_like(magnitude_shifted)
+        # 1. 对单通道进行 2D 傅里叶变换
+        f = torch.fft.fft2(x)  # 2D FFT
+        fshift = torch.fft.fftshift(f, dim=(-2, -1))  # 中心化
 
-    # 将低频区域（中心附近）设为零
-    for i in range(height):
-        for j in range(width):
-            # 计算每个频率点到中心的距离
-            distance = torch.sqrt((i - cy) ** 2 + (j - cx) ** 2)
-            if distance < cutoff_frequency:
-                high_pass[..., i, j] = 0
+        # 2. high-pass mask
+        mask = torch.ones(H, W, dtype=torch.complex64, device=f.device)
+        crow, ccol = H // 2, W // 2
+        mask[crow - low_freq_size:crow + low_freq_size, ccol - low_freq_size:ccol + low_freq_size] = 0
 
-    # 应用高通滤波器
-    filtered_magnitude = magnitude_shifted * high_pass
-    return filtered_magnitude
+        # 3. apply high-pass mask
+        fshift_filtered = fshift * (mask.unsqueeze(0).unsqueeze(0))
 
-if __name__ == '__main__':
+        # 4. 逆傅里叶变换恢复
+        f_ishift = torch.fft.ifftshift(fshift_filtered, dim=(-2, -1))  # 中心化还原
+        img_reconstructed = torch.fft.ifft2(f_ishift)  # 2D IFFT
+        high_freq_x = torch.round(torch.abs(img_reconstructed)).to(torch.uint8)
 
+        # 将结果限制在 [0, 1]
+        #high_freq_x = torch.clamp(high_freq_x, 0, 255)
+        return high_freq_x, mask, fshift
+
+def test_extract_high_freq_feat():
+    # read image
+    origin_img = read_image('/home/caochong/experiments/datasets/VOC0712/VOCdevkit/VOC2007/JPEGImages/003522.jpg')
+    img = origin_img.unsqueeze(0)
+
+    high_freq_x, mask, fshift = extract_high_freq_feat(img)
+    print(high_freq_x.shape)
+    print(img.shape)
+
+    high_freq_x = T.ToPILImage()(high_freq_x[0])
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 3, 1)
+    plt.title("Original Image")
+    plt.imshow(origin_img.permute(1,2,0).numpy())
+    plt.axis("off")
+
+    plt.subplot(1,3, 2)
+    plt.title("mask")
+    plt.imshow(mask.abs().numpy(), cmap='gray', vmin=0, vmax=1)
+    plt.axis("off")
+
+    plt.subplot(1,3, 3)
+    plt.title("high_freq_x")
+    plt.imshow(high_freq_x)
+    plt.axis("off")
+
+    plt.figure(figsize=(12, 6))
+    b, c, h, w = fshift.shape
+    for i in range(c):
+        plt.subplot(1,3, i+1)
+        plt.title("spectrogram {}".format(i+1))
+        # 计算频谱的幅值
+        magnitude = torch.abs(fshift[0][i])
+        # 对幅值进行对数缩放
+        magnitude_spectrum = torch.log(1 + magnitude)
+        plt.imshow(magnitude_spectrum.numpy(), cmap='gray')
+        plt.axis("off")
+
+    plt.show()
+
+def testSwinTransformCustom():
+    # read image
+    # img = read_image('/home/caochong/experiments/datasets/VOC0712/VOCdevkit/VOC2007/JPEGImages/003522.jpg')
+    # inputs = img.unsqueeze(0)
+    # inputs = F.interpolate(inputs, size=(224, 224), mode='bilinear', align_corners=False)
+    # print(inputs.shape, type(inputs))
     inputs = torch.randn(1, 3, 224, 224)
     model = SwinTransformerCustom()
     res = model(inputs)
+
+if __name__ == '__main__':
+
+    #test_extract_high_freq_feat()
+    testSwinTransformCustom()

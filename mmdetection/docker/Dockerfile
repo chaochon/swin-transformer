@@ -42,7 +42,7 @@ RUN pip uninstall $(pip list --format=freeze | grep opencv) -y \
     && pip install opencv-python-headless
 
 # Install MMEngine and MMCV
-RUN pip install "mmengine>=0.7.1"
+RUN pip install "mmengine>=0.10.1"
 RUN git clone -b v2.1.0  https://github.com/open-mmlab/mmcv.git /mmcv \
     && cd /mmcv \
     && pip install -r requirements/optional.txt \
