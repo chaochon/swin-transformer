@@ -477,7 +477,7 @@ class SwinBlockSequence(BaseModule):
 
 
 
-#@MODELS.register_module()
+@MODELS.register_module()
 class SwinTransformerCustom(BaseModule):
     """ Swin Transformer
     A PyTorch implement of : `Swin Transformer:

@@ -1,7 +1,8 @@
 # dataset settings
 dataset_type = 'VOCDataset'
-data_root = '/home/caochong/experiments/datasets/VOC0712/VOCdevkit/'
-#data_root = '/Crack_detection/caochong/datasets/VOCdevkit/'
+#data_root = '/home/caochong/experiments/datasets/VOC0712/VOCdevkit/'
+data_root = '/Crack_detection/caochong/datasets/VOCdevkit/'
+#data_root = '/quzhong_phd/caochong/dataset/VOC0712/VOCdevkit/'
 # Example to use different file client
 # Method 1: simply set the data root and let the file I/O module
 # automatically Infer from prefix (not support LMDB and Memcache yet)
